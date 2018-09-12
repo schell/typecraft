@@ -1,205 +1,421 @@
+{-# LANGUAGE FlexibleContexts  #-}
+{-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE NoImplicitPrelude #-}
-{-# LANGUAGE RecordWildCards   #-}
 
 module Main where
 
-import Collision
-import Data.Data.Lens (biplate)
-import Control.Monad.Reader.Class (ask)
-import Control.Monad.Writer
-import Constants
-import Control.FRPNow.Time (delayTime)
-import Game.Sequoia
-import Game.Sequoia.Utils (showTrace)
-import Game.Sequoia.Color (black, red)
-import Game.Sequoia.Keyboard
-import Game.Sequoia.Window (mousePos, mouseButtons, MouseButton (..))
-import Map (maps)
-import Types hiding (left, left')
-import Utils (alignToGrid)
+import           Art
+import           Behavior
+import           Client
+import           Control.Monad.Reader.Class (MonadReader)
+import           Control.Monad.Trans.Writer.Strict (WriterT (..))
+import           Control.Monad.Writer.Class (MonadWriter (), tell)
+import qualified Data.DList as DL
+import           Data.Ecstasy.Types (Ent (..))
+import           Data.Ecstasy.Types (Hooks (..))
+import qualified Data.Map as M
+import qualified Data.Text as T
+import           Game.Sequoia.Keyboard (Key (..))
+import           Game.Sequoia.Text (plainText)
+import           GameData
+import           Map
+import           Overture hiding (init)
+import           QuadTree.QuadTree (mkQuadTree)
+import qualified QuadTree.QuadTree as QT
 
 
-type Game = WriterT [Command] ((->) State)
-
-myCC :: Building
-myCC = Building
-  { _bPrototype = commandCenter
-  , _bStats = UnitStats 1500
-            $ V2 (10 * fi tileWidth)
-                 (10 * fi tileHeight)
-  }
-
-
-drawBuilding :: Building -> Form
-drawBuilding b = move (b ^. bStats . usPos)
-               . toForm
-               $ b ^. bPrototype . upGfx
-
-
-drawPanel :: Panel a -> Form
-drawPanel Panel {..} =
-  move (_aabbPos _panelAABB + _aabbSize _panelAABB ^* 0.5) _panelForm
-
-
-panels :: [Panel Command]
-panels = [ Panel (mkPanelPos $ V2 (fi gameWidth  - fi x * (r + b))
-                                  (fi gameHeight - fi y * (r + b)))
-                 (fst $ what x y)
-                 (filled black $ rect r r)
-                 (snd $ what x y)
-         | x :: Int <- [1..3]
-         , y :: Int <- [1..3]
-         ]
+screenRect :: (V2, V2)
+screenRect =
+    ( V2 (-buffer)
+         (-buffer)
+    , V2 (gameWidth + buffer)
+         (gameHeight + buffer)
+    )
   where
-    b = 4
-    r = 32
-    mkPanelPos v2 = AABB v2 $ V2 r r
-
-    what 3 3 = (PlaceBuilding commandCenter, Just CKey)
-    what 2 2 = (PlaceBuilding nothing, Just NKey)
-    what _ _ = (DoNothing, Nothing)
+    buffer = 64
 
 
-drawMap :: (Int -> Int -> [Form]) -> V2 -> Form
-drawMap m cam = group
-              $ [ frm
-                | x <- [0 .. (gameWidth  `div` tileWidth)]
-                , y <- [0 .. (gameHeight `div` tileHeight)]
-                , frm <- m (x + d ^. _x) (y + d ^. _y)
-                ]
-  where
-    d = floor <$> cam * V2 (1 / fi tileWidth)
-                           (1 / fi tileHeight)
+initialize :: Game ()
+initialize = do
+  for_ [0 .. 10] $ \i -> do
+    let mine = mod (round i) 2 == (0 :: Int)
+    void $ createEntity marineProto
+      { pos      = Just $ V2 (50 + i * 10 + bool 0 500 mine) (120 + i * 10)
+      , selected = Nothing
+      , owner    = Just $ bool neutralPlayer mePlayer mine
+      }
+
+  issueUnit @AttackCmd () (Ent 0) (Ent 1)
+  issueUnit @AttackCmd () (Ent 9) (Ent 10)
+
+  void $ createEntity garethProto
+    { pos      = Just $ V2 450 400
+    , owner    = Just mePlayer
+    }
+
+  void $ createEntity mineralsProto
+    { pos      = Just $ V2 (tileWidth * 16) (tileHeight * 15)
+    }
+
+  void $ createEntity newEntity
+    { pos      = Just $ V2 500 400
+    , attacks  = Just [gunAttackData]
+    , entSize  = Just 10
+    , speed    = Just 100
+    , selected = Just ()
+    , owner    = Just mePlayer
+    , unitType = Just Unit
+    , hp       = Just $ Limit 100 100
+    , commands = Just $ buildingsWidget : psiStormWidget : stdWidgets
+    }
+
+  join $ gets $ mapSetup . _lsMap
+  void $ start acquireTask
 
 
-getBuildings :: State -> [Building]
-getBuildings s = s ^.. biplate
-
-draw :: V2 -> State -> Form
-draw mpos state = group $
-         ( onmap
-         : drawInputState mpos (state ^. sLocalState . lsInputState)
-         : (drawPanel <$> panels))
-         ++ debugDrawQuad tree
-         -- ++ debugDrawConnectivity tree
-         ++ [state ^. sLocalState . lsDebugVis]
-  where
-    tree = buildQuadTree (100, 100) $ getBuildings state
-    cam = state ^. sLocalState . lsCamera
-    onmap = move (-cam)
-          . group
-          $ drawMap (fromJust (lookup "mindfuck" maps)) cam
-          : (drawBuilding <$> getBuildings state)
+acquireTask :: Task ()
+acquireTask = forever $ do
+  es <- lift . efor aliveEnts $ do
+    with pos
+    with attacks
+    with acqRange
+    without currentCommand
+    queryEnt
+  lift . for_ es $ issueInstant @AcquireCmd ()
+  wait 0.5
 
 
-drawInputState :: V2 -> InputState -> Form
-drawInputState _    NormalState = group []
-drawInputState _    (DebugVisPathingState _) = group []
-drawInputState mpos (PlaceBuildingState up)
-  = move (alignToGrid mpos)
-  . group $
-    [ toForm $ view upGfx up
-    , let w = up ^. upWidth  . to fi
-          h = up ^. upHeight . to fi
-       in move (V2 (w / 2) (h / 2))
-        . filled (rgba 0 1 0 0.5)
-        $ rect w h
+update :: Time -> Game ()
+update dt = do
+  pumpTasks dt
+  updateCommands dt
+
+  emap aliveEnts $ do
+    pure unchanged
+      { lifetime = Modify (+ dt)
+      }
+
+  emap (entsWith art) $ do
+    a <- query art
+    pure unchanged
+      { art = Set $ a & aTime +~ dt
+      }
+
+  -- death to infidels
+  toKill <- efor aliveEnts $ do
+    Limit health _ <- query hp
+    guard $ health <= 0
+    queryEnt
+
+  for_ toKill deleteEntity
+
+
+player :: Time -> Mouse -> Keyboard -> Game ()
+player dt mouse kb = do
+  when (kDown kb EscapeKey || kDown kb CapslockKey) unsetTT
+
+  let scrollSpeed = 300
+  for_ [ (LeftKey,  V2 (-1) 0)
+       , (RightKey, V2 1    0)
+       , (UpKey,    V2 0    (-1))
+       , (DownKey,  V2 0    1)
+       ] $ \(k, v) -> do
+    when (kDown kb k) $ modify $ lsCamera +~ v ^* (scrollSpeed * dt)
+
+  curTT <- gets _lsCommandCont
+  case curTT of
+    Nothing -> playerNotWaiting mouse kb
+    Just tt -> case tt of
+      InstantCommand (GameCont _ f) -> do
+        f ()
+        unsetTT
+      LocationCommand (GameCont _ f) ->
+        when (mPress mouse buttonLeft) $ do
+          f $ mPos mouse
+          unless (kDown kb LeftShiftKey) unsetTT
+      UnitCommand (GameCont _ f) ->
+        when (mPress mouse buttonLeft) $ do
+          msel <- getUnitAtPoint $ mPos mouse
+          for_ msel $ \sel -> do
+            f sel
+            unless (kDown kb LeftShiftKey) unsetTT
+      PlacementCommand (GameCont _ f) ->
+        when (mPress mouse buttonLeft) $ do
+          f $ mPos mouse ^. from centerTileScreen
+          unless (kDown kb LeftShiftKey) unsetTT
+      PassiveCommand _ ->
+        error "someone tried to start a passive"
+      MenuCommand _ ->
+        error "someone tried to start a menu"
+
+  when (mPress mouse buttonRight) unsetTT
+
+
+unsetTT :: Game ()
+unsetTT = modify
+        $ (lsCommandCont .~ Nothing)
+        . (lsExtraButtons .~ Nothing)
+
+
+playerNotWaiting :: Mouse -> Keyboard -> Game ()
+playerNotWaiting mouse kb = do
+  when (mPress mouse buttonLeft) $ do
+    modify $ lsSelBox ?~ mPos mouse
+
+  when (mUnpress mouse buttonLeft) $ do
+    -- TODO(sandy): finicky
+    mp1 <- gets _lsSelBox
+    for_ mp1 $ \p1 -> do
+      -- TODO(sandy): probably shouldn't unset if you keep your dude in the group
+      unsetTT
+
+      lPlayer <- gets _lsPlayer
+
+      modify $ lsSelBox .~ Nothing
+      let p2 = mPos mouse
+          (tl, br) = canonicalizeV2 p1 p2
+
+      -- TODO(sandy): can we use "getUnitsInSquare" instead?
+      emap aliveEnts $ do
+        p    <- query pos
+        o    <- query owner
+        query unitType >>= guard . (/= Missile)
+
+        guard $ not $ isEnemy lPlayer o
+
+        pure unchanged
+          { selected =
+              case liftV2 (<=) tl p && liftV2 (<) p br of
+                True  -> Set ()
+                False -> Unset
+          }
+
+  when (mPress mouse buttonRight) $ do
+    sel <- getSelectedEnts
+    for_ sel $ \ent ->
+      whenM (hasWidget @MoveCmd ent)
+        . issueLocation @MoveCmd () ent
+        $ mPos mouse
+
+  cmds <- getActiveCommands
+  z <- for cmds $ \acts -> do
+    for acts $ \act -> do
+      for (cwHotkey act) $ \hk ->
+        pure $ case kPress kb hk of
+          True  -> Just $ cwCommand act
+          False -> Nothing
+  let zz = listToMaybe
+         . catMaybes
+         . fmap join
+         . catMaybes
+         $ sequence z
+  for_ zz loadWaiting
+
+  pure ()
+
+
+cull :: [(V2, Form)] -> [Form]
+cull = fmap (uncurry move)
+     . filter (flip QT.pointInRect screenRect . fst)
+
+
+getKeyText :: Key -> Form
+getKeyText = toForm . plainText . T.pack . take 1 . show
+
+
+drawWidgets :: [CommandWidget] -> Form
+drawWidgets ws = move (V2 (widgetSize / 2) (widgetSize / 2)) . group $ do
+  w  <- ws
+  cs <- case cwPos w of
+          Just c  -> pure $ toV2 $ fromEnum *** fromEnum $ c
+          Nothing -> empty
+
+  pure $ move (cs ^* (widgetSize + widgetBorder)) $ group
+    [ filled (rgb 0.3 0.3 0.3) $ rect widgetSize widgetSize
+    , maybe mempty getKeyText $ cwHotkey w
     ]
 
-
-toV2 :: (Int, Int) -> V2
-toV2 = uncurry V2 . (fi *** fi)
-
-
-runGame :: N (B Element)
-runGame = do
-  clock      <- deltaTime <$> getClock
-  keyboard   <- getKeyboard
-  mouse      <- mousePos
-  buttons    <- mouseButtons
-  oldButtons <- sample $ delayTime clock (const False) buttons
-
-  (game, _) <- foldmp defState $ \state -> do
-    arrs  <- sample $ arrows keyboard
-    dt    <- sample clock
-    mpos  <- toV2 <$> sample mouse
-    press <- sample $ (\b' b z -> b' z && not (b z)) <$> buttons <*> oldButtons
-
-    hks <- fmap (mapMaybe id) . for panels $ \p ->
-      fmap join . for (_panelHotKey p) $ \hk -> do
-        down <- sample $ isDown keyboard hk
-        if down
-           then pure . Just $  _panelAction p
-           else pure Nothing
-
-    pure $
-      (runUpdateGame state $ updateGame mpos press dt >> tell hks)
-      & sLocalState . lsCamera %~ (+ arrs ^* (10 * 16 * dt))
-
-  pure $ do
-    state <- sample game
-    mpos  <- toV2 <$> sample mouse
-    pure . collage gameWidth gameHeight
-         . pure
-         $ draw mpos state
+actionPanelSize :: V2
+actionPanelSize = toV2 ( (+ 1) . fromEnum $ maxBound @WidgetCol
+                       , (+ 1) . fromEnum $ maxBound @WidgetRow
+                       )
+               ^* (widgetSize + widgetBorder)
 
 
-updateGame :: V2 -> (MouseButton -> Bool) -> Time -> Game ()
-updateGame mpos press _ = do
-  s <- ask
+widgetSize :: Num a => a
+widgetSize = 32
 
-  case s ^. sLocalState . lsInputState of
-    NormalState -> do
-      when (press ButtonLeft)
-          . tell
-          . maybeToList
-          $ getPanelAction panels mpos
-      when (press ButtonRight)
-          . tell
-          . pure
-          $ DebugVisStartPathing mpos
-
-    PlaceBuildingState pt -> do
-      when (press ButtonLeft)
-          . tell
-          . pure
-          . ConfirmBuilding pt
-          $ alignToGrid mpos
-
-    DebugVisPathingState src -> do
-      when (press ButtonRight)
-          . tell
-          . pure
-          $ DebugVisPathing src mpos
+widgetBorder :: Num a => a
+widgetBorder = 4
 
 
+draw :: Mouse -> Game [Form]
+draw mouse = fmap (cull . DL.toList . fst)
+           . surgery runWriterT
+           $ do
 
-runUpdateGame :: State -> Game () -> State
-runUpdateGame s w
-  = ($ s)
-  . appEndo
-  . foldMap (Endo . runCommand)
-  . ($ s)
-  $ execWriterT w
+  cam      <- gets _lsCamera
+  Map {..} <- gets _lsMap
+
+  let emitScreen :: MonadWriter (DL.DList (V2, Form)) m => V2 -> Form -> m ()
+      emitScreen a b = tell $ DL.singleton (a, b)
+
+      emit :: MonadWriter (DL.DList (V2, Form)) m => V2 -> Form -> m ()
+      emit a = emitScreen (a - cam)
+      screenCoords = do
+        x <- [(-1)..(gameWidth `div` tileWidth)]
+        y <- [(-1)..(gameHeight `div` tileHeight)]
+        pure (x, y)
+
+  for_ screenCoords $ \(x, y) -> do
+    let (dx, dy) = cam ^. from centerTileScreen
+        x' = x + dx
+        y' = y + dy
+    for_ (mapGeometry x' y') $ \f ->
+      emit ((x' + 1, y' + 1) ^. centerTileScreen) f
+
+  void . efor aliveEnts $ do
+    p  <- query pos
+    z  <- queryFlag selected
+    sz <- queryDef 10 entSize
+    emit p . boolMonoid z
+           . traced' (rgb 0 1 0)
+           . circle
+           $ sz + 5
+
+  void . efor aliveEnts $ do
+    without gfx
+    without art
+    p  <- query pos
+    o  <- queryDef neutralPlayer owner
+    ut <- query unitType
+    sz <- queryDef 10 entSize
+    (gw, gh) <- queryDef (0, 0) gridSize
+
+    let col = pColor o
+    emit p $
+      case ut of
+        Unit     -> filled col $ circle sz
+        Missile  -> filled (rgb 0 0 0) $ circle 2
+        Building -> filled (rgba 1 0 0 0.5)
+                  $ polygon
+                    [ (0,  0)  ^. centerTileScreen
+                    , (gw, 0)  ^. centerTileScreen
+                    , (gw, gh) ^. centerTileScreen
+                    , (0,  gh) ^. centerTileScreen
+                    ]
+
+  for_ screenCoords $ \(x, y) ->
+    for_ (mapDoodads x y) $ \f ->
+      emit ((x, y) ^. centerTileScreen) f
+
+  void . efor aliveEnts $ do
+    without art
+    p <- query pos
+    g <- query gfx
+    emit p g
+
+  void . efor aliveEnts $ do
+    p <- query pos
+    a <- query art
+    d <- query lastDir
+    emit p . bool (scaleXY (-1) 1)
+                  id
+                  (dot d (V2 1 0) >= 0)
+           $ drawArt a Nothing
+
+  -- draw placement command
+  gets _lsCommandCont >>= \case
+    Just (PlacementCommand gc) ->
+      case cast @_ @(GameCont BuildCmd (Int, Int)) gc of
+        Just (GameCont World{gfx = Just g} _) ->
+          emit (mPos mouse ^. from centerTileScreen . centerTileScreen) g
+        _ -> pure ()
+    _ -> pure ()
+
+  box <- gets _lsSelBox
+  for_ box $ \bpos -> do
+    let (p1, p2) = canonicalizeV2 bpos $ mPos mouse
+        size@(V2 w h) = p2 - p1
+    emit (p1 + size ^* 0.5)
+      . traced' (rgb 0 1 0)
+      $ rect w h
+
+  -- debug draw
+  void . efor aliveEnts $ do
+    p  <- query pos
+    void . optional $ do
+      SomeCommand cmd <- query currentCommand
+      Just (MoveCmd g@(_:_) _ _) <- pure $ cast cmd
+      Unit <- query unitType
+      let ls = defaultLine { lineColor = rgba 0 1 0 0.5 }
+      emit p $ traced ls $ path $ V2 0 0 : fmap (subtract p) g
+      emit (last g) $ outlined ls $ circle 5
+
+    void . optional $ do
+      atts <- query attacks
+      acq  <- query acqRange
+
+      for_ atts $ \att ->
+        emit p $ traced' (rgba 0.7 0 0 0.3) $ circle $ _aRange att
+      emit p $ traced' (rgba 0.4 0.4 0.4 0.3) $ circle $ acq
+
+  mcmds <- getActiveCommands
+  for_ mcmds $ \cmds -> do
+    let ws = drawWidgets cmds
+    emitScreen ( V2 gameWidth gameHeight
+               - actionPanelSize
+               - V2 widgetBorder widgetBorder
+               ) ws
+
+  pure ()
 
 
-
-runCommand :: Command -> State -> State
-runCommand DoNothing           = id
-runCommand (PlaceBuilding pt)  = sLocalState . lsInputState .~ PlaceBuildingState pt
-runCommand (DebugVisStartPathing src)  = sLocalState . lsInputState .~ DebugVisPathingState src
-runCommand (ConfirmBuilding pt pos) = \s ->
-  s & sLocalState . lsInputState .~ NormalState
-    & sGameState . gsPlayers . ix (s ^. sLocalState . lsPlayer) . pOwned . poBuildings %~
-      \bs -> (Building { _bPrototype = pt, _bStats = prototypeToStats pos pt} ) : bs
-runCommand (DebugVisPathing src dst) = \s ->
-  s & sLocalState . lsInputState .~ NormalState
-    & sLocalState . lsDebugVis .~ debugDrawLines red (join (maybeToList $ pathfind (buildQuadTree (100, 100) $ getBuildings s) src dst))
+getActiveCommands
+    :: ( MonadIO m
+       , MonadReader (IORef LocalState) m
+       )
+    => SystemT EntWorld m (Maybe [CommandWidget])
+getActiveCommands = do
+  xcmds <- gets _lsExtraButtons
+  mcmds <- fmap listToMaybe . efor (entsWith selected) $ query commands
+  pure . getFirst $ coerce xcmds <> coerce mcmds
 
 
 main :: IO ()
-main = play config (const runGame) pure
+main =
+    play config
+         (const $ run realState hooks initialize player update draw)
+         pure
   where
     config = EngineConfig (gameWidth, gameHeight) "Typecraft"
-           $ rgb 0.25 0.55 0.95
+           $ rgb 0 0 0
+
+    hooks = Hooks
+      { hookNewEnt = \e -> do
+          eon e (with gridSize) >>= traverse_ (const recomputeNavMesh)
+          eon e (with animBundle) >>= traverse_ (const $ playAnim e [AnimIdle])
+      , hookDelEnt = \e -> do
+          everything <- getEntity e
+          for_ (gridSize everything) . const . start $ lift recomputeNavMesh
+          for_ (activePassives everything)
+            . traverse_
+            $ \(SomeCommand (a :: a)) -> endCommand @a e $ Just a
+      }
+
+    realState = LocalState
+          { _lsSelBox       = Nothing
+          , _lsPlayer       = mePlayer
+          , _lsTasks        = mempty
+          , _lsNewTasks     = []
+          , _lsTaskId       = 0
+          , _lsDynamic      = mkQuadTree (20, 20) (V2 (200 * 32) (200 * 32))
+          , _lsMap          = theMap
+          , _lsNavMesh      = mapNavMesh theMap
+          , _lsCommandCont  = Nothing
+          , _lsCamera       = V2 0 0
+          , _lsExtraButtons = Nothing
+          }
+
+    theMap = maps M.! "wc2"
 

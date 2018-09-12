@@ -14,7 +14,8 @@ cabal-version:       >=1.10
 
 executable typecraft
   main-is:             Main.hs
-  -- other-modules:
+  other-modules: AbilityUtils, Behavior, Types, Client, Overture, GameData, Map, QuadTree.QuadTree, Art, AnimBank, Behavior.Scripts
+  ghc-options: -Wall
   default-extensions: DataKinds
                     , FlexibleInstances
                     , GADTs
@@ -27,23 +28,32 @@ executable typecraft
                     , ViewPatterns
 
   build-depends: base
-               , astar
                , base-prelude
-               , constraints
                , containers
-               , unordered-containers
-               , data-default
+               , array
+               , ecstasy
+               , dlist
                , frpnow
+               , astar
                , htiled
-               , aeson-tiled
+               , jps
+               , deepseq
                , lens
                , linear
+               , monad-coroutine
                , mtl
-               , recursion-schemes
                , sequoia
-               , th-dict-discovery
                , transformers
-               , QuadTree
+               , unordered-containers
+               , recursion-schemes
+               , vector
+               , bones
+               , bytestring
+               , aeson
+               , string-conv
+               , errors
+               , rio
+               , text
   hs-source-dirs:      src
   default-language:    Haskell2010
 
